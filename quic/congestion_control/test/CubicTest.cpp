@@ -426,4 +426,179 @@ TEST_F(CubicTest, RecoveryWithEmptyLastMaxCwndOrLastReductionTime) {
 #endif
 }
 
+TEST_F(CubicTest, RateLimitedIncreaseDraftExample) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 1000;
+  conn.transportSettings.minCwndInMss = 2;
+  conn.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled = true;
+
+  Cubic cubic(conn, 10000, Cubic::INIT_SSTHRESH);
+  EXPECT_EQ(CubicStates::Hystart, cubic.state());
+
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 10000u);
+
+  uint64_t seq = 0;
+  uint64_t offset = 0;
+  std::deque<uint64_t> pendingSeqNums;
+  std::deque<OutstandingPacketWrapper> pendingPackets;
+
+  auto sendOne = [&]() {
+    auto packet = makeTestingWritePacket(seq, 1000, offset + 1000);
+    conn.lossState.largestSent = seq;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    pendingSeqNums.push_back(seq);
+    pendingPackets.push_back(std::move(packet));
+    offset += 1000;
+    seq++;
+  };
+
+  auto ackOldest = [&]() {
+    auto ackSeq = pendingSeqNums.front();
+    auto& packet = pendingPackets.front();
+    auto sentTime = packet.metadata.time;
+    pendingSeqNums.pop_front();
+    pendingPackets.pop_front();
+    quic::test::onPacketAckOrLossWrapper(
+        &conn,
+        &cubic,
+        makeAck(ackSeq, 1000, Clock::now(), sentTime),
+        std::nullopt);
+  };
+
+  // Round One. Send 4, ack 4
+  for (int i = 0; i < 4; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 10000u);
+  for (int i = 0; i < 4; i++) {
+    ackOldest();
+    EXPECT_EQ(cubic.getCongestionWindow(), 10000u + (i + 1) * 1000);
+  }
+  EXPECT_EQ(cubic.getCongestionWindow(), 14000u);
+
+  // Round Two, Send 8, ack 8
+  for (int i = 0; i < 8; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 10000u);
+  for (int i = 0; i < 8; i++) {
+    ackOldest();
+  }
+  EXPECT_EQ(cubic.getCongestionWindow(), 20000u);
+
+  // Round Three, send 4, ack 4
+  for (int i = 0; i < 4; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 10000u);
+  for (int i = 0; i < 4; i++) {
+    ackOldest();
+  }
+  EXPECT_EQ(cubic.getCongestionWindow(), 20000u);
+
+  // Round Four, send 20, ack 20
+  for (int i = 0; i < 20; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 20000u);
+  for (int i = 0; i < 20; i++) {
+    ackOldest();
+  }
+  EXPECT_EQ(cubic.getCongestionWindow(), 40000u);
+}
+
+TEST_F(CubicTest, RateLimitedIncreaseResetsOnLoss) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 1000;
+  conn.transportSettings.minCwndInMss = 2;
+  conn.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled = true;
+
+  Cubic cubic(conn, 10000, Cubic::INIT_SSTHRESH);
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 10000u);
+
+  uint64_t seq = 0;
+  uint64_t offset = 0;
+  std::deque<uint64_t> pendingSeqNums;
+  std::deque<OutstandingPacketWrapper> pendingPackets;
+
+  auto sendOne = [&]() {
+    auto packet = makeTestingWritePacket(seq, 1000, offset + 1000);
+    conn.lossState.largestSent = seq;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    pendingSeqNums.push_back(seq);
+    pendingPackets.push_back(std::move(packet));
+    offset += 1000;
+    seq++;
+  };
+
+  // Grow maxFlightSizeBytes
+  for (int i = 0; i < 20; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 20000u);
+
+  // Trigger a loss on the oldest packet.
+  auto& lostPacket = pendingPackets.front();
+  LossEvent loss;
+  loss.addLostPacket(lostPacket);
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &cubic, std::nullopt, std::move(loss));
+  pendingSeqNums.pop_front();
+  pendingPackets.pop_front();
+
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 0u);
+
+  // Ack the next outstanding packet and verify maxFlightSizeBytes reflects new
+  // inflight.
+  auto ackSeq = pendingSeqNums.front();
+  auto& ackedPacket = pendingPackets.front();
+  auto sentTime = ackedPacket.metadata.time;
+  quic::test::onPacketAckOrLossWrapper(
+      &conn,
+      &cubic,
+      makeAck(ackSeq, 1000, Clock::now(), sentTime),
+      std::nullopt);
+
+  EXPECT_LT(conn.lossState.maxFlightSizeBytes, 20000u);
+}
+
+TEST_F(CubicTest, RateLimitedIncreaseResetsOnPersistentCongestion) {
+  QuicConnectionStateBase conn(QuicNodeType::Client);
+  conn.udpSendPacketLen = 1000;
+  conn.transportSettings.minCwndInMss = 2;
+  conn.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled = true;
+
+  Cubic cubic(conn, 10000, Cubic::INIT_SSTHRESH);
+
+  uint64_t seq = 0;
+  uint64_t offset = 0;
+  std::deque<uint64_t> pendingSeqNums;
+  std::deque<OutstandingPacketWrapper> pendingPackets;
+
+  auto sendOne = [&]() {
+    auto packet = makeTestingWritePacket(seq, 1000, offset + 1000);
+    conn.lossState.largestSent = seq;
+    quic::test::onPacketsSentWrapper(&conn, &cubic, packet);
+    pendingSeqNums.push_back(seq);
+    pendingPackets.push_back(std::move(packet));
+    offset += 1000;
+    seq++;
+  };
+
+  for (int i = 0; i < 20; i++) {
+    sendOne();
+  }
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 20000u);
+
+  // Persistent congestion loss
+  auto& lostPacket = pendingPackets.front();
+  LossEvent loss;
+  loss.addLostPacket(lostPacket);
+  loss.persistentCongestion = true;
+  quic::test::onPacketAckOrLossWrapper(
+      &conn, &cubic, std::nullopt, std::move(loss));
+
+  EXPECT_EQ(CubicStates::Hystart, cubic.state());
+  EXPECT_EQ(conn.lossState.maxFlightSizeBytes, 0u);
+}
 } // namespace quic::test

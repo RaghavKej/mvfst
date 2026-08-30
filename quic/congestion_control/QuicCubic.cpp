@@ -32,6 +32,7 @@ Cubic::Cubic(
       std::max(
           initCwndBytes,
           conn.transportSettings.initCwndInMss * conn.udpSendPacketLen));
+  conn_.lossState.maxFlightSizeBytes = cwndBytes_;
   steadyState_.tcpFriendly = tcpFriendly;
   steadyState_.estRenoCwnd = cwndBytes_;
   hystartState_.ackTrain = ackTrain;
@@ -81,6 +82,8 @@ void Cubic::handoff(
     steadyState_.lastMaxCwndBytes = cwndBytes_;
     steadyState_.lastReductionTime = lastReductionTime;
   }
+  conn_.lossState.maxFlightSizeBytes =
+      std::max(conn_.lossState.maxFlightSizeBytes, cwndBytes_);
 }
 
 uint64_t Cubic::getCongestionWindow() const noexcept {
@@ -103,6 +106,9 @@ void Cubic::onPersistentCongestion() {
   }
   steadyState_.lastReductionTime.reset();
   steadyState_.lastMaxCwndBytes.reset();
+  if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+    resetMaxFlightSize(conn_);
+  }
   quiescenceStart_.reset();
   hystartState_.found = Cubic::HystartFound::No;
   hystartState_.inRttRound = false;
@@ -384,6 +390,9 @@ void Cubic::cubicReduction(TimePoint lossTime) noexcept {
   if (steadyState_.tcpFriendly) {
     steadyState_.estRenoCwnd = cwndBytes_;
   }
+  if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+    resetMaxFlightSize(conn_);
+  }
 }
 
 void Cubic::onPacketAckOrLoss(
@@ -403,6 +412,15 @@ void Cubic::onPacketAckOrLoss(
     MVCHECK(!ackEvent->ackedPackets.empty());
     onPacketAcked(*ackEvent);
   }
+}
+
+// TODO: This is a Reno style cap (2*maxFS or maxFS + 1MSS); can this
+// be changed to cubic specific (cap growth at cwnd achieved if maxFS)
+// bytes are received?
+uint64_t Cubic::ratelimitedIncreaseCap(bool inSlowStart) const noexcept {
+  return inSlowStart
+      ? 2 * conn_.lossState.maxFlightSizeBytes
+      : conn_.lossState.maxFlightSizeBytes + conn_.udpSendPacketLen;
 }
 
 void Cubic::onPacketAcked(const AckEvent& ack) {
@@ -554,6 +572,10 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
       conn_.udpSendPacketLen,
       conn_.transportSettings.maxCwndInMss,
       conn_.transportSettings.minCwndInMss);
+
+  if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+    cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(true));
+  }
 
   Optional<Cubic::ExitReason> exitReason;
   SCOPE_EXIT {
@@ -803,6 +825,9 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
           conn_.transportSettings.minCwndInMss);
     }
   }
+  if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+    newCwnd = std::min(newCwnd, ratelimitedIncreaseCap(false));
+  }
   if (newCwnd < cwndBytes_) {
     MVVLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
                << ", new cnwd = " << newCwnd
@@ -824,6 +849,9 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         conn_.transportSettings.maxCwndInMss,
         conn_.transportSettings.minCwndInMss);
     cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
+    if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+      cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(false));
+    }
     QLOG(
         conn_,
         addMetricUpdate,
@@ -876,6 +904,9 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
     }
     updateTimeToOrigin();
     cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
+    if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+      cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(false));
+    }
     QLOG(
         conn_,
         addCongestionStateUpdate,
@@ -902,6 +933,9 @@ void Cubic::onEcnCongestionEvent(const AckEvent& ack) {
       steadyState_.estRenoCwnd = ssthresh_;
       cwndBytes_ = ssthresh_;
       l4sCwndReducedTimestamp_ = ack.ackTime;
+      if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+        resetMaxFlightSize(conn_);
+      }
     }
   }
   lastCECount_ = ack.ecnCECount;

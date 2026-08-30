@@ -50,6 +50,11 @@ struct CongestionControlConfig {
   bool hystartEnabled{true};
 
   // Used by: Cubic
+  // draft-ietf-ccwg-ratelimited-increase, caps cwnd when sending is
+  // rate/application limited.
+  bool ratelimitedCwndIncreaseEnabled{false};
+
+  // Used by: Cubic
   // Whether to clamp the cwnd growth when the connection is not cwnd limited.
   bool onlyGrowCwndWhenLimited{false};
 

@@ -1173,6 +1173,8 @@ quic::Expected<void, QuicError> updateConnection(
         conn.lossState.inflightBytes,
         pkt.metadata.encodedSize,
         2 * conn.transportSettings.maxCwndInMss * conn.udpSendPacketLen);
+    // Tracked regardless of if the flag is set
+    updateMaxFlightSize(conn);
     conn.congestionController->onPacketSent(pkt);
   }
   if (conn.pacer) {

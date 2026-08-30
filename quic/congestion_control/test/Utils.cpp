@@ -19,6 +19,7 @@ void onPacketsSentWrapper(
       conn->lossState.inflightBytes,
       packet.metadata.encodedSize,
       2 * conn->transportSettings.maxCwndInMss * conn->udpSendPacketLen);
+  updateMaxFlightSize(*conn);
   cc->onPacketSent(packet);
 }
 

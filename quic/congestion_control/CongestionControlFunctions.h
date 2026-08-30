@@ -26,6 +26,15 @@ PacingRate calculatePacingRate(
     uint64_t minCwndInMss,
     std::chrono::microseconds rtt);
 
+inline void resetMaxFlightSize(QuicConnectionStateBase& conn) noexcept {
+  conn.lossState.maxFlightSizeBytes = 0;
+}
+
+inline void updateMaxFlightSize(QuicConnectionStateBase& conn) noexcept {
+  conn.lossState.maxFlightSizeBytes = std::max(
+      conn.lossState.maxFlightSizeBytes, conn.lossState.inflightBytes);
+}
+
 template <class T1, class T2, class T3 = T1>
 void addAndCheckOverflow(
     T1& value,

@@ -115,6 +115,7 @@ class Cubic : public CongestionController {
   CubicStates state_{CubicStates::Hystart};
 
  private:
+  uint64_t ratelimitedIncreaseCap(bool inSlowStart) const noexcept;
   [[nodiscard]] bool isAppIdle() const noexcept;
   void onPacketAcked(const AckEvent& ack);
   void onPacketAckedInHystart(const AckEvent& ack);
