@@ -415,8 +415,8 @@ void Cubic::onPacketAckOrLoss(
 }
 
 // TODO: This is a Reno style cap (2*maxFS or maxFS + 1MSS); can this
-// be changed to cubic specific (cap growth at cwnd achieved if maxFS)
-// bytes are received?
+// be changed to cubic specific (cap growth at cwnd achieved if maxFS
+// bytes are received)?
 uint64_t Cubic::ratelimitedIncreaseCap(bool inSlowStart) const noexcept {
   return inSlowStart
       ? 2 * conn_.lossState.maxFlightSizeBytes
