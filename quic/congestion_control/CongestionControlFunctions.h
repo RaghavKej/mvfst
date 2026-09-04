@@ -28,11 +28,14 @@ PacingRate calculatePacingRate(
 
 inline void resetMaxFlightSize(QuicConnectionStateBase& conn) noexcept {
   conn.lossState.maxFlightSizeBytes = 0;
+  conn.lossState.lastMaxFlightSizeIncreaseTime.reset();
 }
 
 inline void updateMaxFlightSize(QuicConnectionStateBase& conn) noexcept {
-  conn.lossState.maxFlightSizeBytes = std::max(
-      conn.lossState.maxFlightSizeBytes, conn.lossState.inflightBytes);
+  if (conn.lossState.inflightBytes > conn.lossState.maxFlightSizeBytes) {
+    conn.lossState.maxFlightSizeBytes = conn.lossState.inflightBytes;
+    conn.lossState.lastMaxFlightSizeIncreaseTime = Clock::now();
+  }
 }
 
 template <class T1, class T2, class T3 = T1>

@@ -294,7 +294,28 @@ void Cubic::updateTimeToOrigin() noexcept {
   steadyState_.originPoint = *steadyState_.lastMaxCwndBytes;
 }
 
-int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
+int64_t Cubic::computeCubicDelta(TimePoint t) const noexcept {
+  if (t < *steadyState_.lastReductionTime) {
+    return 0;
+  }
+  auto timeElapsed = folly::chrono::ceil<std::chrono::milliseconds>(
+      t - *steadyState_.lastReductionTime);
+  auto timeElapsedCount = static_cast<double>(timeElapsed.count());
+  if (std::pow((timeElapsedCount - steadyState_.timeToOrigin), 3) >
+      std::numeric_limits<double>::max()) {
+    // (timeElapsed - timeToOrigin) ^ 3 will overflow/underflow, cut delta
+    // to numeric_limit
+    return timeElapsedCount > steadyState_.timeToOrigin
+        ? std::numeric_limits<int64_t>::max()
+        : std::numeric_limits<uint64_t>::min();
+  }
+  return static_cast<int64_t>(std::floor(
+      conn_.udpSendPacketLen * kTimeScalingFactor *
+      std::pow((timeElapsedCount - steadyState_.timeToOrigin), 3.0) / 1000 /
+      1000 / 1000));
+}
+
+int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) const noexcept {
   // TODO: should we also add a rttMin to timeElapsed?
   if (ackTime < *steadyState_.lastReductionTime) {
     MVLOG_WARNING << "Cubic ackTime earlier than reduction time";
@@ -302,21 +323,11 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
   }
   auto timeElapsed = folly::chrono::ceil<std::chrono::milliseconds>(
       ackTime - *steadyState_.lastReductionTime);
-  int64_t delta = 0;
-  auto timeElapsedCount = static_cast<double>(timeElapsed.count());
-  if (std::pow((timeElapsedCount - steadyState_.timeToOrigin), 3) >
-      std::numeric_limits<double>::max()) {
-    // (timeElapsed - timeToOrigin) ^ 3 will overflow/underflow, cut delta
-    // to numeric_limit
+  auto delta = computeCubicDelta(ackTime);
+
+  if (delta == std::numeric_limits<int64_t>::max() ||
+      delta == std::numeric_limits<int64_t>::min()) {
     MVLOG_WARNING << "Quic Cubic: (t-K) ^ 3 overflows";
-    delta = timeElapsedCount > steadyState_.timeToOrigin
-        ? std::numeric_limits<int64_t>::max()
-        : std::numeric_limits<uint64_t>::min();
-  } else {
-    delta = static_cast<int64_t>(std::floor(
-        conn_.udpSendPacketLen * kTimeScalingFactor *
-        std::pow((timeElapsedCount - steadyState_.timeToOrigin), 3.0) / 1000 /
-        1000 / 1000));
   }
   MVVLOG(15) << "Cubic steady cwnd increase: current cwnd=" << cwndBytes_
              << ", timeElapsed=" << timeElapsed.count()
@@ -348,7 +359,7 @@ int64_t Cubic::calculateCubicCwndDelta(TimePoint ackTime) noexcept {
   return delta;
 }
 
-uint64_t Cubic::calculateCubicCwnd(int64_t delta) noexcept {
+uint64_t Cubic::calculateCubicCwnd(int64_t delta) const noexcept {
   // TODO: chromium has a limit on targetCwnd to be no larger than half of acked
   // packet size. Linux also has a limit the cwnd increase to 1 MSS per 2 ACKs.
   if (delta > 0 &&
@@ -414,13 +425,22 @@ void Cubic::onPacketAckOrLoss(
   }
 }
 
-// TODO: This is a Reno style cap (2*maxFS or maxFS + 1MSS); can this
-// be changed to cubic specific (cap growth at cwnd achieved if maxFS
-// bytes are received)?
-uint64_t Cubic::ratelimitedIncreaseCap(bool inSlowStart) const noexcept {
-  return inSlowStart
-      ? 2 * conn_.lossState.maxFlightSizeBytes
-      : conn_.lossState.maxFlightSizeBytes + conn_.udpSendPacketLen;
+uint64_t Cubic::ratelimitedIncreaseCap(
+    TimePoint ackTime,
+    bool inSlowStart,
+    bool inRenoFriendlyRegion) const noexcept {
+  if (inSlowStart) {
+    return 2 * conn_.lossState.maxFlightSizeBytes;
+  }
+  auto effectiveTime =
+      conn_.lossState.lastMaxFlightSizeIncreaseTime.value_or(ackTime);
+  auto delta = computeCubicDelta(effectiveTime + conn_.lossState.srtt);
+  auto cubicCap = calculateCubicCwnd(delta);
+  if (inRenoFriendlyRegion) {
+    auto renoCap = conn_.lossState.maxFlightSizeBytes + conn_.udpSendPacketLen;
+    return std::max(cubicCap, renoCap);
+  }
+  return cubicCap;
 }
 
 void Cubic::onPacketAcked(const AckEvent& ack) {
@@ -574,7 +594,8 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
       conn_.transportSettings.minCwndInMss);
 
   if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-    cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(true));
+    cwndBytes_ =
+        std::min(cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, true, false));
   }
 
   Optional<Cubic::ExitReason> exitReason;
@@ -826,7 +847,8 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
     }
   }
   if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-    newCwnd = std::min(newCwnd, ratelimitedIncreaseCap(false));
+    newCwnd =
+        std::min(newCwnd, ratelimitedIncreaseCap(ack.ackTime, false, false));
   }
   if (newCwnd < cwndBytes_) {
     MVVLOG(10) << "Cubic steady state calculates a smaller cwnd than last round"
@@ -850,7 +872,10 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
         conn_.transportSettings.minCwndInMss);
     cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
     if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-      cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(false));
+      bool inRenoFriendlyRegion = cwndBytes_ == steadyState_.estRenoCwnd;
+      cwndBytes_ = std::min(
+          cwndBytes_,
+          ratelimitedIncreaseCap(ack.ackTime, false, inRenoFriendlyRegion));
     }
     QLOG(
         conn_,
@@ -905,7 +930,8 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
     updateTimeToOrigin();
     cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
     if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-      cwndBytes_ = std::min(cwndBytes_, ratelimitedIncreaseCap(false));
+      cwndBytes_ = std::min(
+          cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, false, false));
     }
     QLOG(
         conn_,

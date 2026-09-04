@@ -103,6 +103,8 @@ struct LossState {
   uint64_t inflightBytes{0};
   // Maximum inflight bytes since last loss; reset to 0 on loss
   uint64_t maxFlightSizeBytes{0};
+  // Last time maxFlightSizeBytes was increased
+  Optional<TimePoint> lastMaxFlightSizeIncreaseTime;
   // Reordering threshold used
   uint32_t reorderingThreshold{kReorderingThreshold};
   // Number of packet loss timer fired before receiving an ack

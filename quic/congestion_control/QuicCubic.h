@@ -115,7 +115,10 @@ class Cubic : public CongestionController {
   CubicStates state_{CubicStates::Hystart};
 
  private:
-  uint64_t ratelimitedIncreaseCap(bool inSlowStart) const noexcept;
+  uint64_t ratelimitedIncreaseCap(
+      TimePoint ackTime,
+      bool inSlowStart,
+      bool inRenoFriendlyRegion) const noexcept;
   [[nodiscard]] bool isAppIdle() const noexcept;
   void onPacketAcked(const AckEvent& ack);
   void onPacketAckedInHystart(const AckEvent& ack);
@@ -134,8 +137,9 @@ class Cubic : public CongestionController {
 
   void cubicReduction(TimePoint lossTime) noexcept;
   void updateTimeToOrigin() noexcept;
-  int64_t calculateCubicCwndDelta(TimePoint timePoint) noexcept;
-  uint64_t calculateCubicCwnd(int64_t delta) noexcept;
+  int64_t calculateCubicCwndDelta(TimePoint timePoint) const noexcept;
+  uint64_t calculateCubicCwnd(int64_t delta) const noexcept;
+  int64_t computeCubicDelta(TimePoint t) const noexcept;
 
   bool isRecovered(TimePoint packetSentTime) noexcept;
 
