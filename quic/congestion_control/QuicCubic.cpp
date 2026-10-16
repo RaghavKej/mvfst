@@ -17,6 +17,7 @@
 #include <quic/state/QuicStateFunctions.h>
 
 #include <folly/Chrono.h>
+#include <chrono>
 
 namespace quic {
 
@@ -232,11 +233,16 @@ void Cubic::setAppIdle(bool idle, TimePoint eventTime) noexcept {
   if (!currentAppIdle && idle) {
     quiescenceStart_ = eventTime;
   }
-  if (!idle && currentAppIdle && *quiescenceStart_ <= eventTime &&
-      steadyState_.lastReductionTime) {
-    *steadyState_.lastReductionTime +=
-        folly::chrono::ceil<std::chrono::milliseconds>(
-            eventTime - *quiescenceStart_);
+  if (!idle && currentAppIdle && *quiescenceStart_ <= eventTime) {
+    auto idleMs = folly::chrono::ceil<std::chrono::milliseconds>(
+        eventTime - *quiescenceStart_);
+    if (steadyState_.lastReductionTime) {
+      *steadyState_.lastReductionTime += idleMs;
+    }
+    if (conn_.lossState.lastMaxFlightSizeIncreaseTime) {
+      *conn_.lossState.lastMaxFlightSizeIncreaseTime = std::min(
+          *conn_.lossState.lastMaxFlightSizeIncreaseTime + idleMs, eventTime);
+    }
   }
   if (!idle) {
     quiescenceStart_.reset();
