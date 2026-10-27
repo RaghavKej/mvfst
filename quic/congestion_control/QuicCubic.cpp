@@ -125,6 +125,9 @@ void Cubic::onPersistentCongestion() {
 }
 
 void Cubic::onPacketSent(const OutstandingPacketWrapper& /* packet */) {
+  if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
+    discountRatelimitedTime();
+  }
   if (conn_.transportSettings.ccaConfig.leaveHeadroomForCwndLimited) {
     // Consider cwndBlocked if inflight bytes >= 0.5 * cwnd
     isCwndBlocked_ = conn_.lossState.inflightBytes >= (cwndBytes_ >> 1);
@@ -242,6 +245,10 @@ void Cubic::setAppIdle(bool idle, TimePoint eventTime) noexcept {
     if (conn_.lossState.lastMaxFlightSizeIncreaseTime) {
       *conn_.lossState.lastMaxFlightSizeIncreaseTime = std::min(
           *conn_.lossState.lastMaxFlightSizeIncreaseTime + idleMs, eventTime);
+    }
+    if (lastSeenMaxFlightIncrease_) {
+      lastSeenMaxFlightIncrease_ =
+          std::min(*lastSeenMaxFlightIncrease_ + idleMs, eventTime);
     }
   }
   if (!idle) {
@@ -447,6 +454,30 @@ uint64_t Cubic::ratelimitedIncreaseCap(
     return std::max(cubicCap, renoCap);
   }
   return cubicCap;
+}
+
+void Cubic::discountRatelimitedTime() noexcept {
+  auto cur = conn_.lossState.lastMaxFlightSizeIncreaseTime;
+  if (!cur) {
+    lastSeenMaxFlightIncrease_.reset();
+    return;
+  }
+  if (lastSeenMaxFlightIncrease_ && *cur > *lastSeenMaxFlightIncrease_ &&
+      state_ == CubicStates::Steady && steadyState_.lastReductionTime) {
+    // Time spent with flight size below max (rate limited) must not advance the
+    // Cubic clock. Otherwise, when a new maximum is set, the time since
+    // lastReductionTime includes this and the cap jumps. Move lastReductionTime
+    // forward by the stall minus one srtt so each new max advances the cap by
+    // at most one rtt of cubic growth.
+    auto gap = *cur - *lastSeenMaxFlightIncrease_;
+    if (gap > conn_.lossState.srtt) {
+      auto shift = folly::chrono::ceil<std::chrono::milliseconds>(
+          gap - conn_.lossState.srtt);
+      *steadyState_.lastReductionTime =
+          std::min(*steadyState_.lastReductionTime + shift, *cur);
+    }
+  }
+  lastSeenMaxFlightIncrease_ = cur;
 }
 
 void Cubic::onPacketAcked(const AckEvent& ack) {

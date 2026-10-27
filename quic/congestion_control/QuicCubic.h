@@ -119,6 +119,8 @@ class Cubic : public CongestionController {
       TimePoint ackTime,
       bool inSlowStart,
       bool inRenoFriendlyRegion) const noexcept;
+  void discountRatelimitedTime() noexcept;
+  Optional<TimePoint> lastSeenMaxFlightIncrease_;
   [[nodiscard]] bool isAppIdle() const noexcept;
   void onPacketAcked(const AckEvent& ack);
   void onPacketAckedInHystart(const AckEvent& ack);
