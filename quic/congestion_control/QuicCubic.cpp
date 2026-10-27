@@ -469,12 +469,19 @@ void Cubic::discountRatelimitedTime() noexcept {
     // lastReductionTime includes this and the cap jumps. Move lastReductionTime
     // forward by the stall minus one srtt so each new max advances the cap by
     // at most one rtt of cubic growth.
-    auto gap = *cur - *lastSeenMaxFlightIncrease_;
-    if (gap > conn_.lossState.srtt) {
-      auto shift = folly::chrono::ceil<std::chrono::milliseconds>(
-          gap - conn_.lossState.srtt);
-      *steadyState_.lastReductionTime =
-          std::min(*steadyState_.lastReductionTime + shift, *cur);
+    auto start =
+        std::max(*lastSeenMaxFlightIncrease_, *steadyState_.lastReductionTime);
+    if (*cur > start) {
+      auto gap = *cur - start;
+      if (gap > conn_.lossState.srtt) {
+        auto shift = folly::chrono::ceil<std::chrono::milliseconds>(
+            gap - conn_.lossState.srtt);
+        auto limit = *cur - conn_.lossState.srtt;
+        auto shifted = *steadyState_.lastReductionTime + shift;
+        if (shifted > *steadyState_.lastReductionTime) {
+          *steadyState_.lastReductionTime = std::min(shifted, limit);
+        }
+      }
     }
   }
   lastSeenMaxFlightIncrease_ = cur;
@@ -612,6 +619,7 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
   if (!hystartState_.inRttRound) {
     startHystartRttRound(ack.ackTime);
   }
+  const auto prevCwnd = cwndBytes_;
 
   // TODO: Should we not increase cwnd if inflight is less than half of cwnd?
   // Note that we take bytes out of inflightBytes before invoke the state
@@ -631,8 +639,9 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
       conn_.transportSettings.minCwndInMss);
 
   if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-    cwndBytes_ =
-        std::min(cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, true, false));
+    cwndBytes_ = std::max(
+        prevCwnd,
+        std::min(cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, true, false)));
   }
 
   Optional<Cubic::ExitReason> exitReason;
@@ -765,7 +774,6 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
  * Theoretically, both paper and Linux/Chromium should result to the same cwnd.
  */
 void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
-  const auto prevCwnd = cwndBytes_;
   if (isAppLimited()) {
     QLOG(
         conn_,
@@ -796,6 +804,8 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
   if (ack.ecnCECount > lastCECount_) {
     onEcnCongestionEvent(ack);
   }
+
+  const auto prevCwnd = cwndBytes_;
 
   // From here on, the cwnd can only increase
 
@@ -969,10 +979,13 @@ void Cubic::onPacketAckedInRecovery(const AckEvent& ack) {
       return;
     }
     updateTimeToOrigin();
+    const auto prevCwnd = cwndBytes_;
     cwndBytes_ = calculateCubicCwnd(calculateCubicCwndDelta(ack.ackTime));
     if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
-      cwndBytes_ = std::min(
-          cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, false, false));
+      cwndBytes_ = std::max(
+          prevCwnd,
+          std::min(
+              cwndBytes_, ratelimitedIncreaseCap(ack.ackTime, false, false)));
     }
     QLOG(
         conn_,
