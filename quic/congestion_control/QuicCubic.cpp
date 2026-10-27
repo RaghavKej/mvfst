@@ -765,6 +765,7 @@ void Cubic::onPacketAckedInHystart(const AckEvent& ack) {
  * Theoretically, both paper and Linux/Chromium should result to the same cwnd.
  */
 void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
+  const auto prevCwnd = cwndBytes_;
   if (isAppLimited()) {
     QLOG(
         conn_,
@@ -910,9 +911,12 @@ void Cubic::onPacketAckedInSteady(const AckEvent& ack) {
     cwndBytes_ = std::max(cwndBytes_, steadyState_.estRenoCwnd);
     if (conn_.transportSettings.ccaConfig.ratelimitedCwndIncreaseEnabled) {
       bool inRenoFriendlyRegion = cwndBytes_ == steadyState_.estRenoCwnd;
-      cwndBytes_ = std::min(
-          cwndBytes_,
-          ratelimitedIncreaseCap(ack.ackTime, false, inRenoFriendlyRegion));
+      cwndBytes_ = std::max(
+          prevCwnd,
+          std::min(
+              cwndBytes_,
+              ratelimitedIncreaseCap(
+                  ack.ackTime, false, inRenoFriendlyRegion)));
     }
     QLOG(
         conn_,
